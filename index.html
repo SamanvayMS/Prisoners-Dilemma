@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Axelrod&#x27;s Tournament in OpenAI Gym — Samanvay M. S.</title>
+<meta name="description" content="Learning strategies for the iterated prisoner&#x27;s dilemma." />
+<meta property="og:title" content="Axelrod&#x27;s Tournament in OpenAI Gym" />
+<meta property="og:description" content="Learning strategies for the iterated prisoner&#x27;s dilemma." />
+<meta property="og:type" content="website" />
+<style>
+  :root {
+    --ink: #050506; --accent: #0ea5e9; --accent-light: #38bdf8;
+    --mute-300: #d1d5db; --mute-400: #9ca3af; --mute-500: #6b7280;
+    --glass-04: rgba(255,255,255,.04); --glass-08: rgba(255,255,255,.08);
+    --glass-12: rgba(255,255,255,.12);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { background: var(--ink); }
+  body {
+    font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: var(--mute-300); background: var(--ink); line-height: 1.65;
+    min-height: 100vh; -webkit-font-smoothing: antialiased;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 1.25rem;
+  }
+  /* soft radial glow behind the card */
+  body::before {
+    content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+    background:
+      radial-gradient(60rem 40rem at 50% -10%, rgba(14,165,233,.18), transparent 60%),
+      radial-gradient(40rem 30rem at 110% 10%, rgba(56,189,248,.08), transparent 60%);
+  }
+  .wrap { position: relative; z-index: 1; width: 100%; max-width: 720px; margin: auto; }
+  a { color: var(--accent-light); text-decoration: none; }
+  .back {
+    display: inline-flex; align-items: center; gap: .5rem; font-size: .875rem;
+    color: var(--mute-400); margin-bottom: 2rem; transition: color .2s;
+  }
+  .back:hover { color: #fff; }
+  .card {
+    background: var(--glass-04); border: 1px solid var(--glass-08);
+    border-radius: 1.5rem; padding: 2.5rem; backdrop-filter: blur(12px);
+  }
+  .eyebrow {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .75rem;
+    letter-spacing: .08em; text-transform: uppercase; color: var(--accent);
+    margin-bottom: 1rem;
+  }
+  h1 {
+    font-size: clamp(1.9rem, 5vw, 2.8rem); font-weight: 700; line-height: 1.1;
+    color: #fff; letter-spacing: -.02em;
+    background: linear-gradient(to right, #fff, var(--mute-300));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .tagline { font-size: 1.15rem; color: var(--mute-300); margin-top: .9rem; }
+  .tags { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1.5rem 0; }
+  .tag {
+    font-size: .75rem; padding: .3rem .75rem; border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent-light); border: 1px solid var(--glass-08);
+  }
+  .body p { margin-top: 1rem; color: var(--mute-300); }
+  code {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .85em;
+    background: var(--glass-08); padding: .1rem .4rem; border-radius: .35rem;
+    color: var(--accent-light);
+  }
+  .hl-title {
+    font-size: .75rem; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--mute-500); margin: 2rem 0 .75rem;
+  }
+  ul.hl { list-style: none; display: grid; gap: .6rem; }
+  ul.hl li { position: relative; padding-left: 1.5rem; color: var(--mute-300); }
+  ul.hl li::before {
+    content: ""; position: absolute; left: 0; top: .6rem; width: .5rem; height: .5rem;
+    border-radius: 999px; background: var(--accent);
+    box-shadow: 0 0 12px rgba(14,165,233,.7);
+  }
+  .actions { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 2.25rem; }
+  .btn {
+    display: inline-flex; align-items: center; gap: .5rem; font-size: .9rem;
+    font-weight: 500; padding: .7rem 1.3rem; border-radius: 999px;
+    border: 1px solid var(--glass-12); transition: all .2s;
+  }
+  .btn-primary { background: var(--accent); color: #04121b; border-color: transparent; }
+  .btn-primary:hover { background: var(--accent-light); }
+  .btn-ghost { color: var(--mute-300); }
+  .btn-ghost:hover { background: var(--glass-08); color: #fff; }
+  footer {
+    position: relative; z-index: 1; margin-top: 2.5rem; font-size: .8rem;
+    color: var(--mute-500); text-align: center;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <a class="back" href="https://samanvayms.github.io/">&larr; Back to portfolio</a>
+    <main class="card">
+      <div class="eyebrow">Python · Jupyter</div>
+      <h1>Axelrod's Tournament in OpenAI Gym</h1>
+      <p class="tagline">Learning strategies for the iterated prisoner's dilemma.</p>
+      <div class="tags"><span class="tag">OpenAI Gym</span><span class="tag">Reinforcement Learning</span><span class="tag">Game Theory</span></div>
+      <div class="body"><p>A custom OpenAI Gym environment for Axelrod's iterated prisoner's dilemma tournament. Alongside classic baselines like Tit-for-Tat, it implements two learning agents — a Boltzmann machine and a deep neural network — that learn competitive strategies through repeated play.</p></div>
+      <div class="hl-title">Highlights</div>
+      <ul class="hl"><li>Custom Axelrod-tournament Gym environment</li><li>Boltzmann-machine &amp; deep-neural-network agents</li><li>Classic strategy baselines (Tit-for-Tat and more)</li></ul>
+      <div class="actions">
+        <a class="btn btn-primary" href="https://github.com/SamanvayMS/Prisoners-Dilemma">View on GitHub &nearr;</a>
+        <a class="btn btn-ghost" href="https://samanvayms.github.io/">All repositories</a>
+      </div>
+    </main>
+    <footer>Samanvay Malapally Sudhakara · <a href="https://samanvayms.github.io/">samanvayms.github.io</a></footer>
+  </div>
+</body>
+</html>
