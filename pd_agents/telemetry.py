@@ -1,9 +1,12 @@
-"""Per-decision log (JSONL) and the per-agent report built from it."""
+"""Per-decision log (JSONL) of what axelrod doesn't record (tokens, retries,
+latency), and the per-agent report."""
 
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Optional
+
+import axelrod as axl
 
 # USD per million tokens (input, output) for cost estimates. Local models are free.
 PRICES = {
@@ -12,12 +15,18 @@ PRICES = {
     "claude-opus-5-5": (4.0, 20.0),
     "claude-fable-5-1": (10.0, 50.0),
 }
+_STATES = ((axl.Action.C, axl.Action.C), (axl.Action.C, axl.Action.D),
+           (axl.Action.D, axl.Action.C), (axl.Action.D, axl.Action.D))
 
 
-def price_for(provider: str, model: str) -> Optional[tuple]:
+def estimate_cost(provider: str, model: str, input_tokens: float, output_tokens: float) -> Optional[float]:
+    """USD, or None when the model's price is unknown."""
     if provider in ("ollama", "mock"):
-        return (0.0, 0.0)
-    return PRICES.get(model)
+        return 0.0
+    price = PRICES.get(model)
+    if price is None:
+        return None
+    return (input_tokens * price[0] + output_tokens * price[1]) / 1e6
 
 
 def log_decision(path: Optional[str], record: dict) -> None:
@@ -37,71 +46,67 @@ def load_decisions(path) -> list:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def summarise_agents(records: list) -> dict:
-    """Per-agent stats, including the empirical memory-one fingerprint:
-    P(cooperate | previous round was CC, CD, DC, DD) from the agent's point of view."""
-    agents = defaultdict(lambda: {
-        "decisions": 0, "cooperations": 0, "attempts": 0, "retried": 0,
-        "input_tokens": 0, "output_tokens": 0, "latency_s": 0.0,
-        "provider": None, "model": None, "mode": None,
-        "fingerprint_counts": {k: [0, 0] for k in ("CC", "CD", "DC", "DD")},
-    })
+def summarise_usage(records: list) -> dict:
+    """Per-agent decisions, retries, tokens, latency and cost from the decision log."""
+    usage = defaultdict(Counter)
+    meta = {}
     for r in records:
-        a = agents[r["agent"]]
-        a["provider"], a["model"], a["mode"] = r["provider"], r["model"], r["mode"]
-        a["decisions"] += 1
-        a["cooperations"] += r["move"] == "C"
-        a["attempts"] += r["attempts"]
-        a["retried"] += r["attempts"] > 1
-        a["input_tokens"] += r["input_tokens"]
-        a["output_tokens"] += r["output_tokens"]
-        a["latency_s"] += r["latency_s"]
-        if r.get("prev"):
-            counts = a["fingerprint_counts"][r["prev"]]
-            counts[0] += r["move"] == "C"
-            counts[1] += 1
+        meta[r["agent"]] = (r["provider"], r["model"])
+        u = usage[r["agent"]]
+        u["decisions"] += 1
+        u["retried"] += r["attempts"] > 1
+        for key in ("attempts", "input_tokens", "output_tokens", "latency_s"):
+            u[key] += r[key]
     out = {}
-    for name, a in agents.items():
-        n = a["decisions"] or 1
-        price = price_for(a["provider"], a["model"])
-        cost = None
-        if price is not None:
-            cost = (a["input_tokens"] * price[0] + a["output_tokens"] * price[1]) / 1e6
+    for name, u in usage.items():
+        n = u["decisions"]
         out[name] = {
-            **{k: a[k] for k in ("provider", "model", "mode", "decisions", "retried",
-                                 "input_tokens", "output_tokens")},
-            "cooperation_rate": a["cooperations"] / n,
-            "mean_attempts": a["attempts"] / n,
-            "mean_latency_s": a["latency_s"] / n,
-            "cost_usd": cost,
-            "fingerprint": {
-                k: (c / t if t else None) for k, (c, t) in a["fingerprint_counts"].items()
-            },
+            "decisions": n,
+            "retried": u["retried"],
+            "mean_attempts": u["attempts"] / n,
+            "mean_latency_s": u["latency_s"] / n,
+            "input_tokens": u["input_tokens"],
+            "output_tokens": u["output_tokens"],
+            "cost_usd": estimate_cost(*meta[name], u["input_tokens"], u["output_tokens"]),
         }
     return out
 
 
-def write_report(summary: dict, ranked_names: list, path) -> None:
+def memory_one_fingerprint(results, index: int) -> dict:
+    """P(C | previous round as (own, opponent)) for one player, pooled over its matches."""
+    counts = sum(results.state_to_action_distribution[index], Counter())
+    fingerprint = {}
+    for state in _STATES:
+        coop, total = counts[(state, axl.Action.C)], counts[(state, axl.Action.C)] + counts[(state, axl.Action.D)]
+        fingerprint[f"{state[0]}{state[1]}"] = coop / total if total else None
+    return fingerprint
+
+
+def _fmt(value: Optional[float]) -> str:
+    return "-" if value is None else f"{value:.2f}"
+
+
+def write_report(results, usage: dict, path) -> None:
+    ranked = results.ranked_names
     lines = ["# Agent report", ""]
-    for name, s in summary.items():
-        rank = ranked_names.index(name) + 1 if name in ranked_names else "?"
-        cost = "n/a" if s["cost_usd"] is None else f"${s['cost_usd']:.4f}"
-        fp = s["fingerprint"]
-        fmt = lambda v: "-" if v is None else f"{v:.2f}"  # noqa: E731
+    for name, u in usage.items():
+        index = results.players.index(name)
+        fp = memory_one_fingerprint(results, index)
+        cost = "n/a" if u["cost_usd"] is None else f"${u['cost_usd']:.4f}"
         lines += [
             f"## {name}",
             "",
-            f"- Rank: {rank} of {len(ranked_names)}",
-            f"- Decisions: {s['decisions']}, cooperation rate {s['cooperation_rate']:.2%}",
-            f"- Decisions that needed a retry: {s['retried']} (mean attempts {s['mean_attempts']:.2f})",
-            f"- Tokens: {s['input_tokens']} in / {s['output_tokens']} out, cost {cost}",
-            f"- Mean latency per decision: {s['mean_latency_s']:.2f}s",
+            f"- Rank: {ranked.index(name) + 1} of {len(ranked)}",
+            f"- Decisions: {u['decisions']}, cooperation rate {results.cooperating_rating[index]:.2%}",
+            f"- Decisions that needed a retry: {u['retried']} (mean attempts {u['mean_attempts']:.2f})",
+            f"- Tokens: {u['input_tokens']} in / {u['output_tokens']} out, cost {cost}",
+            f"- Mean latency per decision: {u['mean_latency_s']:.2f}s",
             "",
             "Memory-one fingerprint, P(C | previous round as (own, opponent)):",
             "",
             "| CC | CD | DC | DD |",
             "|---|---|---|---|",
-            f"| {fmt(fp['CC'])} | {fmt(fp['CD'])} | {fmt(fp['DC'])} | {fmt(fp['DD'])} |",
+            f"| {_fmt(fp['CC'])} | {_fmt(fp['CD'])} | {_fmt(fp['DC'])} | {_fmt(fp['DD'])} |",
             "",
             "For reference: TFT = 1, 0, 1, 0; WSLS = 1, 0, 0, 1; Grim = 1, 0, 0, 0.",
             "",

@@ -17,22 +17,28 @@ records the design and the decisions behind it.
 
 ```
 run_tournament.py          CLI; preset-only unless --with-agents
-pd_agents/decision.py      Decision {move: "C"|"D"}, its JSON schema, tolerant parser
+pd_agents/decision.py      Decision {move: "C"|"D"}, its JSON schema, strict and lenient parsers
 pd_agents/prompt.py        system prompt (rules, payoffs) and per-round history prompt
 pd_agents/backends.py      retry loop; Anthropic, OpenAI-compatible and mock backends
 pd_agents/player.py        LLMPlayer(axl.Player)
 pd_agents/tournament.py    preset rosters; AgentTournament (parallel mode that can abort)
-pd_agents/telemetry.py     per-decision JSONL, agent report, memory-one fingerprint
-tests/                     44 tests, no network needed
+pd_agents/telemetry.py     per-decision JSONL (tokens, retries, latency), agent report
+tests/                     57 tests, no network needed
 ```
 
 ## How it works
 
 **The answer contract.** Every backend sends the same JSON schema: one property,
 `move`, with enum `["C", "D"]`. Anthropic gets it as `output_config.format`, and
-OpenAI-compatible servers get it as `response_format`. The parser also accepts the
-`<think>` blocks, code fences and `cooperate`/`defect` spellings that local servers
-sometimes produce. Anything else counts as an invalid answer and is retried.
+OpenAI-compatible servers get it as `response_format`. Anthropic answers are parsed
+strictly. Answers from OpenAI-compatible servers, which don't all enforce the schema,
+are parsed leniently: `<think>` blocks, code fences and `cooperate`/`defect`
+spellings are accepted. Anything else counts as an invalid answer and is retried.
+
+**Retries.** `Backend.decide` is the only retry loop; the SDK clients' own retries
+are turned off, so `--agent-retries` is the real number of attempts per move.
+Backoff is exponential (capped at 60 s) and never shorter than the server's
+`retry-after`.
 
 **What `fast` and `reasoning` mean per model.**
 
@@ -59,11 +65,16 @@ cooperation summary.
   can run matches in worker processes. So `LLMPlayer` only takes plain values and
   creates its API client on its first move, inside the worker.
 - `LLMPlayer` is marked `stochastic`, so axelrod never caches its matches as deterministic.
-- Stock axelrod waits forever if a parallel worker raises. `AgentTournament`
-  forwards the error, terminates the workers and stops the run. Serial mode
-  needed no change.
-- Strategies that read their opponent's code (for example Geller) are dropped when
-  agents play, because they would call the agent's model to peek at its next move.
+- Stock axelrod hand-rolls its worker processes and waits forever if one raises.
+  `AgentTournament` overrides only `_run_parallel`, running matches on a
+  `multiprocessing.Pool`: the worker's exception is re-raised in the parent and the
+  other workers are terminated. Serial mode needed no change.
+- Strategies that read their opponent's code (`axl.Classifiers.obey_axelrod` is
+  false) are dropped when agents play, because they would call the agent's model to
+  peek at its next move.
+- Cooperation rate and the memory-one fingerprint come from axelrod's `ResultSet`
+  (`cooperating_rating`, `state_to_action_distribution`), i.e. from the moves
+  actually played. The JSONL log only adds what axelrod doesn't record.
 - axelrod is pinned to 4.13.1. Version 4.14 adds a hard PyTorch dependency for one
   strategy that this project doesn't use.
 
@@ -81,7 +92,7 @@ would be making moves mid-match. A refusal is retried on the same model instead.
 
 ## Verified
 
-- 44 unit and integration tests: answer parsing, prompts, Anthropic and
+- 57 unit and integration tests: answer parsing, prompts, Anthropic and
   OpenAI-compatible request shapes against fake clients, the retry and abort
   paths, clone/pickle, serial and parallel tournaments, and the CLI.
 - End-to-end CLI runs with mock agents, including `--plots` and an abort in

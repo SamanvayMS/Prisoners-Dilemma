@@ -11,15 +11,15 @@ Examples:
 import argparse
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import axelrod as axl
 
-from pd_agents.backends import MODES, PROVIDERS, AgentDecisionError
+from pd_agents.backends import AgentDecisionError, validate_agent
 from pd_agents.player import LLMPlayer
-from pd_agents.telemetry import load_decisions, price_for, summarise_agents, write_report
-from pd_agents.tournament import ROSTERS, AgentTournament, is_cheater
+from pd_agents.telemetry import estimate_cost, load_decisions, summarise_usage, write_report
+from pd_agents.tournament import ROSTERS, AgentTournament
 
 DEFAULT_AGENTS = ["anthropic:claude-haiku-4-5@fast", "anthropic:claude-opus-5-5@reasoning"]
 
@@ -42,10 +42,10 @@ class AgentSpec:
         if not sep or not rest:
             raise argparse.ArgumentTypeError(f"agent must look like PROVIDER:MODEL[@MODE], got {text!r}")
         model, _, mode = rest.rpartition("@") if "@" in rest else (rest, "", "fast")
-        if provider not in PROVIDERS:
-            raise argparse.ArgumentTypeError(f"unknown provider {provider!r}; choose from {PROVIDERS}")
-        if mode not in MODES:
-            raise argparse.ArgumentTypeError(f"unknown mode {mode!r}; choose from {MODES}")
+        try:
+            validate_agent(provider, mode)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
         return cls(provider, model, mode)
 
 
@@ -98,12 +98,11 @@ def build_agents(args, log_path):
     specs = args.agent or [AgentSpec.parse(s) for s in DEFAULT_AGENTS]
     agents = []
     for spec in specs:
-        provider, model = (spec.provider, spec.model)
-        if args.mock_agents:
-            provider, model = "mock", f"tft-as-{spec.model}"
-        base_url = {"ollama": args.ollama_url, "openai": args.openai_base_url}.get(provider)
+        if args.mock_agents:  # keep the real model as the label so agent names stay distinct
+            spec = replace(spec, provider="mock", model=f"tft:{spec.model}")
+        base_url = {"ollama": args.ollama_url, "openai": args.openai_base_url}.get(spec.provider)
         agents.append(LLMPlayer(
-            provider=provider, model=model, mode=spec.mode, effort=args.reasoning_effort,
+            provider=spec.provider, model=spec.model, mode=spec.mode, effort=args.reasoning_effort,
             base_url=base_url, extra_body=args.openai_extra_body, retries=args.agent_retries,
             history_window=args.history_window, reveal_length=args.reveal_length,
             log_path=str(log_path),
@@ -116,14 +115,15 @@ def estimate(agents, n_players, args):
     n-1 players and itself; in self-play both sides call the model."""
     turns = args.turns
     calls = args.repetitions * turns * (n_players + 1)
-    window = min(turns / 2, args.history_window or turns / 2)
+    window = turns / 2  # mean history length shown
+    if args.history_window:
+        window = min(window, args.history_window)
     in_tokens = calls * (_PROMPT_BASE_TOKENS + _TOKENS_PER_HISTORY_ROW * window)
     rows = []
     for agent in agents:
-        out_tokens = calls * _OUTPUT_TOKENS[agent.mode]
-        price = price_for(agent.provider, agent.model)
-        cost = None if price is None else (in_tokens * price[0] + out_tokens * price[1]) / 1e6
-        rows.append((agent.name, calls, cost))
+        cfg = agent.init_kwargs
+        out_tokens = calls * _OUTPUT_TOKENS[cfg["mode"]]
+        rows.append((agent.name, calls, estimate_cost(cfg["provider"], cfg["model"], in_tokens, out_tokens)))
     return rows
 
 
@@ -168,10 +168,12 @@ def main(argv=None) -> int:
     players = ROSTERS[args.roster]()
     agents = []
     if args.with_agents:
-        dropped = [str(p) for p in players if is_cheater(p)]
+        # Cheaters read the opponent's code: against an agent they would call its
+        # model to peek at its next move.
+        dropped = [str(p) for p in players if not axl.Classifiers.obey_axelrod(p)]
         if dropped:
             print(f"Dropping strategies that inspect their opponent's code: {', '.join(dropped)}")
-        players = [p for p in players if not is_cheater(p)]
+        players = [p for p in players if axl.Classifiers.obey_axelrod(p)]
         agents = build_agents(args, log_path)
         if not confirm(estimate(agents, len(players) + len(agents), args), args):
             return 1
@@ -192,15 +194,14 @@ def main(argv=None) -> int:
     (out_dir / "ranked.txt").write_text("\n".join(ranked) + "\n", encoding="utf-8")
     results.write_summary(str(out_dir / "summary.csv"))
     with open(out_dir / "payoff_matrix.json", "w", encoding="utf-8") as f:
-        json.dump({"players": [str(p) for p in players], "payoff_matrix": results.payoff_matrix}, f, indent=1)
+        json.dump({"players": results.players, "payoff_matrix": results.payoff_matrix}, f, indent=1)
 
     print("\nRanking:")
     for i, name in enumerate(ranked, 1):
         print(f"{i:>3}. {name}")
 
     if agents:
-        summary = summarise_agents(load_decisions(log_path))
-        write_report(summary, ranked, out_dir / "agent_report.md")
+        write_report(results, summarise_usage(load_decisions(log_path)), out_dir / "agent_report.md")
         print(f"\nAgent report: {out_dir / 'agent_report.md'}")
     if args.plots:
         save_plots(results, out_dir)

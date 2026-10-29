@@ -9,13 +9,17 @@ from .backends import DecisionRequest, make_backend
 from .prompt import system_prompt, user_prompt
 from .telemetry import log_decision
 
+# Constructor arguments that configure the prompt/logging rather than the backend.
+_PLAYER_ONLY_ARGS = ("history_window", "reveal_length", "log_path")
+
 
 class LLMPlayer(axl.Player):
     """Sees the full game history and answers C or D through a model backend.
 
     axelrod re-creates players from their constructor arguments for every match
-    (`clone()`), and may run matches in worker processes, so the constructor only
-    takes plain values and the API client is created on the first move.
+    (`clone()`, via `self.init_kwargs`), and may run matches in worker processes,
+    so the constructor only takes plain values and the backend is created on the
+    first move.
     """
 
     name = "LLM"
@@ -43,16 +47,6 @@ class LLMPlayer(axl.Player):
         log_path: Optional[str] = None,
     ) -> None:
         super().__init__()
-        self.provider = provider
-        self.model = model
-        self.mode = mode
-        self.effort = effort
-        self.base_url = base_url
-        self.extra_body = extra_body
-        self.retries = retries
-        self.history_window = history_window
-        self.reveal_length = reveal_length
-        self.log_path = log_path
         self.name = f"LLM {mode} ({provider}:{model})"
         self._backend = None
 
@@ -61,36 +55,32 @@ class LLMPlayer(axl.Player):
 
     def backend(self):
         if self._backend is None:
-            self._backend = make_backend(
-                self.provider, self.model, self.mode, effort=self.effort,
-                base_url=self.base_url, extra_body=self.extra_body, retries=self.retries,
-            )
+            kwargs = {k: v for k, v in self.init_kwargs.items() if k not in _PLAYER_ONLY_ARGS}
+            self._backend = make_backend(**kwargs)
         return self._backend
 
     def _known_length(self) -> Optional[int]:
         length = self.match_attributes["length"]
-        if not self.reveal_length or length is None or length < 0 or math.isinf(length):
+        if not self.init_kwargs["reveal_length"] or length is None or length < 0 or math.isinf(length):
             return None
         return int(length)
 
     def strategy(self, opponent: axl.Player) -> axl.Action:
+        cfg = self.init_kwargs
         game = self.match_attributes["game"]
-        own, opp = list(self.history), list(opponent.history)
         request = DecisionRequest(
             system=system_prompt(game, self._known_length(), self.match_attributes["noise"]),
-            user=user_prompt(game, own, opp, self.history_window),
-            own=own,
-            opp=opp,
+            user=user_prompt(game, self.history, opponent.history, cfg["history_window"]),
+            opp=opponent.history,
         )
         result = self.backend().decide(request)
-        log_decision(self.log_path, {
+        log_decision(cfg["log_path"], {
             "agent": self.name,
-            "provider": self.provider,
-            "model": self.model,
-            "mode": self.mode,
+            "provider": cfg["provider"],
+            "model": cfg["model"],
+            "mode": cfg["mode"],
             "opponent": str(opponent),
-            "round": len(own) + 1,
-            "prev": f"{own[-1]}{opp[-1]}" if own else None,
+            "round": len(self.history) + 1,
             "move": result.decision.move,
             "attempts": result.attempts,
             "input_tokens": result.input_tokens,

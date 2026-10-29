@@ -150,7 +150,16 @@ def test_openai_compat_retries_truncated_and_aborts_on_unknown_model():
         oai_backend(create).decide(REQ)
 
 
+def test_retry_after_header_sets_minimum_backoff():
+    exc = status_error(anthropic.RateLimitError, 429)
+    exc.response.headers["retry-after"] = "7"
+    assert anthropic_backend(FakeCreate())._delay(1, exc) == 7.0
+
+
 def test_mock_backends():
     assert MockBackend("flaky").decide(REQ).attempts == 2
+    assert MockBackend("alld:label").decide(REQ).decision.move == "D"
     with pytest.raises(AgentDecisionError):
         MockBackend("broken", retries=2).decide(REQ)
+    with pytest.raises(ValueError, match="unknown mock behaviour"):
+        MockBackend("titfortat")

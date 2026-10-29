@@ -1,12 +1,14 @@
 """Model backends. Each one turns (system, user) prompts into a Decision.
 
-`Backend.decide` owns the retry loop: an answer that is not an actionable move,
-a refusal, a truncated answer or a transient API error is retried with
-exponential backoff. If every attempt fails it raises AgentDecisionError, which
-stops the tournament. Errors that retrying cannot fix (bad credentials, unknown
-model, malformed request) stop it immediately.
+`Backend.decide` owns the only retry loop (the SDK clients' own retries are
+off): an answer that is not an actionable move, a refusal, a truncated answer
+or a transient API error is retried with exponential backoff, honouring the
+server's retry-after. If every attempt fails it raises AgentDecisionError,
+which stops the tournament. Errors that retrying cannot fix (bad credentials,
+unknown model, malformed request) stop it immediately.
 """
 
+import dataclasses
 import os
 import random
 import time
@@ -16,82 +18,92 @@ from typing import Optional, Sequence
 
 import axelrod as axl
 
-from .decision import DECISION_SCHEMA, Decision, InvalidDecision, parse_decision
+from .decision import DECISION_SCHEMA, Decision, InvalidDecision, parse_decision, parse_decision_lenient
 
 PROVIDERS = ("anthropic", "ollama", "openai", "mock")
 MODES = ("fast", "reasoning")
-DEFAULT_OLLAMA_URL = "http://localhost:11434/v1"
+MOCK_BEHAVIOURS = ("tft", "allc", "alld", "random", "flaky", "broken")
+
+# provider -> (base-URL env var, default base URL, API-key env var, default API key)
+_OPENAI_COMPAT = {
+    "ollama": ("OLLAMA_BASE_URL", "http://localhost:11434/v1", None, "ollama"),
+    "openai": ("OPENAI_BASE_URL", None, "OPENAI_API_KEY", "not-needed"),
+}
+# Error classes, by name, that both SDKs raise for requests retrying can't fix.
+_FATAL_ERRORS = ("AuthenticationError", "PermissionDeniedError", "NotFoundError",
+                 "BadRequestError", "UnprocessableEntityError")
+_MAX_BACKOFF_S = 60.0
 
 
 class AgentDecisionError(RuntimeError):
     """An agent could not produce an actionable move; the tournament must stop."""
 
 
+def validate_agent(provider: str, mode: str) -> None:
+    if provider not in PROVIDERS:
+        raise ValueError(f"unknown provider {provider!r}; choose from {PROVIDERS}")
+    if mode not in MODES:
+        raise ValueError(f"unknown mode {mode!r}; choose from {MODES}")
+
+
 @dataclass
 class DecisionRequest:
     system: str
     user: str
-    own: Sequence[axl.Action] = ()
     opp: Sequence[axl.Action] = ()
 
 
 @dataclass
 class DecisionResult:
     decision: Decision
-    attempts: int
     input_tokens: int = 0
     output_tokens: int = 0
-    latency_s: float = 0.0
     stop_reason: Optional[str] = None
+    attempts: int = 1
+    latency_s: float = 0.0
     errors: list = field(default_factory=list)
 
 
-@dataclass
-class _Attempt:
-    decision: Decision
-    input_tokens: int = 0
-    output_tokens: int = 0
-    stop_reason: Optional[str] = None
-
-
 class Backend(ABC):
+    sdk = None  # SDK module whose error classes `_is_fatal` checks
+
     def __init__(self, model: str, mode: str, retries: int = 6, backoff_s: float = 1.0):
-        if mode not in MODES:
-            raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
         self.model = model
         self.mode = mode
         self.retries = retries
         self.backoff_s = backoff_s
 
     @abstractmethod
-    def _attempt(self, request: DecisionRequest) -> _Attempt:
-        """One model call. Raise InvalidDecision or a retryable error on failure."""
+    def _attempt(self, request: DecisionRequest) -> DecisionResult:
+        """One model call. Raise InvalidDecision or an SDK error on failure."""
 
     def _is_fatal(self, exc: Exception) -> bool:
-        return False
+        return self.sdk is not None and isinstance(exc, tuple(getattr(self.sdk, n) for n in _FATAL_ERRORS))
+
+    def _delay(self, attempt: int, exc: Exception) -> float:
+        delay = min(self.backoff_s * 2 ** (attempt - 1), _MAX_BACKOFF_S) * (1 + random.random() * 0.25)
+        response = getattr(exc, "response", None)
+        retry_after = getattr(response, "headers", {}).get("retry-after") if response is not None else None
+        try:
+            return max(delay, float(retry_after)) if retry_after else delay
+        except ValueError:
+            return delay
 
     def decide(self, request: DecisionRequest) -> DecisionResult:
         errors = []
         start = time.monotonic()
         for attempt in range(1, self.retries + 1):
             try:
-                out = self._attempt(request)
+                result = self._attempt(request)
             except Exception as exc:  # noqa: BLE001 - classified below
                 if self._is_fatal(exc):
                     raise AgentDecisionError(f"{self.model}: {type(exc).__name__}: {exc}") from exc
                 errors.append(f"{type(exc).__name__}: {exc}")
                 if attempt < self.retries:
-                    time.sleep(min(self.backoff_s * 2 ** (attempt - 1), 30.0) * (1 + random.random() * 0.25))
+                    time.sleep(self._delay(attempt, exc))
                 continue
-            return DecisionResult(
-                decision=out.decision,
-                attempts=attempt,
-                input_tokens=out.input_tokens,
-                output_tokens=out.output_tokens,
-                latency_s=time.monotonic() - start,
-                stop_reason=out.stop_reason,
-                errors=errors,
-            )
+            return dataclasses.replace(result, attempts=attempt, latency_s=time.monotonic() - start,
+                                       errors=errors)
         raise AgentDecisionError(
             f"{self.model} ({self.mode}) gave no actionable move after {self.retries} attempts: "
             + " | ".join(errors[-3:])
@@ -117,47 +129,32 @@ def anthropic_request_params(model: str, mode: str, effort: str) -> dict:
 
 class AnthropicBackend(Backend):
     def __init__(self, model: str, mode: str, effort: str = "high", **kw):
-        super().__init__(model, mode, **kw)
-        self.params = anthropic_request_params(model, mode, effort)
-        self._client = None
-
-    def _get_client(self):
-        if self._client is None:
-            import anthropic
-
-            self._client = anthropic.Anthropic(max_retries=2)
-        return self._client
-
-    def _is_fatal(self, exc):
         import anthropic
 
-        return isinstance(
-            exc,
-            (
-                anthropic.AuthenticationError,
-                anthropic.PermissionDeniedError,
-                anthropic.NotFoundError,
-                anthropic.BadRequestError,
-                anthropic.UnprocessableEntityError,
-            ),
-        )
+        super().__init__(model, mode, **kw)
+        self.sdk = anthropic
+        self.params = anthropic_request_params(model, mode, effort)
+        self.params["output_config"] = {
+            **self.params.get("output_config", {}),
+            "format": {"type": "json_schema", "schema": DECISION_SCHEMA},
+        }
+        self._client = None
 
     def _attempt(self, request):
-        params = dict(self.params)
-        output_config = {**params.pop("output_config", {}), "format": {"type": "json_schema", "schema": DECISION_SCHEMA}}
-        response = self._get_client().messages.create(
+        if self._client is None:
+            self._client = self.sdk.Anthropic(max_retries=0)
+        response = self._client.messages.create(
             model=self.model,
             system=request.system,
             messages=[{"role": "user", "content": request.user}],
-            output_config=output_config,
-            **params,
+            **self.params,
         )
         if response.stop_reason == "refusal":
             raise InvalidDecision(f"refusal: {getattr(response, 'stop_details', None)}")
         if response.stop_reason == "max_tokens":
             raise InvalidDecision("answer truncated at max_tokens")
         text = next((b.text for b in response.content if b.type == "text"), "")
-        return _Attempt(
+        return DecisionResult(
             decision=parse_decision(text),
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
@@ -168,69 +165,44 @@ class AnthropicBackend(Backend):
 class OpenAICompatBackend(Backend):
     """Any OpenAI-compatible chat completions endpoint: Ollama, vLLM, LM Studio, OpenAI."""
 
-    def __init__(
-        self,
-        model: str,
-        mode: str,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        effort: str = "high",
-        extra_body: Optional[dict] = None,
-        **kw,
-    ):
-        super().__init__(model, mode, **kw)
-        self.base_url = base_url
-        self.api_key = api_key
-        self.effort = effort
-        self.extra_body = extra_body or {}
-        self._client = None
-
-    def _get_client(self):
-        if self._client is None:
-            import openai
-
-            self._client = openai.OpenAI(base_url=self.base_url, api_key=self.api_key, max_retries=2)
-        return self._client
-
-    def _is_fatal(self, exc):
+    def __init__(self, model: str, mode: str, base_url: Optional[str] = None, api_key: Optional[str] = None,
+                 effort: str = "high", extra_body: Optional[dict] = None, **kw):
         import openai
 
-        return isinstance(
-            exc,
-            (
-                openai.AuthenticationError,
-                openai.PermissionDeniedError,
-                openai.NotFoundError,
-                openai.BadRequestError,
-                openai.UnprocessableEntityError,
-            ),
-        )
+        super().__init__(model, mode, **kw)
+        self.sdk = openai
+        self.base_url = base_url
+        self.api_key = api_key
+        self.params = {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "decision", "schema": DECISION_SCHEMA, "strict": True},
+            },
+            "max_tokens": 8192 if mode == "reasoning" else 256,
+            "extra_body": extra_body,
+        }
+        if mode == "reasoning":
+            self.params["reasoning_effort"] = effort
+        self._client = None
 
     def _attempt(self, request):
-        kwargs = {}
-        if self.mode == "reasoning":
-            kwargs["reasoning_effort"] = self.effort
-        response = self._get_client().chat.completions.create(
+        if self._client is None:
+            self._client = self.sdk.OpenAI(base_url=self.base_url, api_key=self.api_key, max_retries=0)
+        response = self._client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": request.system},
                 {"role": "user", "content": request.user},
             ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"name": "decision", "schema": DECISION_SCHEMA, "strict": True},
-            },
-            max_tokens=8192 if self.mode == "reasoning" else 256,
-            extra_body=self.extra_body or None,
-            **kwargs,
+            **self.params,
         )
         choice = response.choices[0]
         if choice.finish_reason == "length":
             hint = "" if self.mode == "reasoning" else " (if this is a thinking model, run it in reasoning mode)"
             raise InvalidDecision("answer truncated at max_tokens" + hint)
         usage = response.usage
-        return _Attempt(
-            decision=parse_decision(choice.message.content or ""),
+        return DecisionResult(
+            decision=parse_decision_lenient(choice.message.content or ""),
             input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
             output_tokens=getattr(usage, "completion_tokens", 0) or 0,
             stop_reason=choice.finish_reason,
@@ -238,50 +210,43 @@ class OpenAICompatBackend(Backend):
 
 
 class MockBackend(Backend):
-    """Offline backend for tests and dry runs. `model` picks the behaviour:
-    tft, allc, alld, random, or flaky (garbage on the first attempt of every decision,
-    then tit-for-tat), or broken (never answers)."""
+    """Offline backend for tests and dry runs. `model` is BEHAVIOUR or BEHAVIOUR:LABEL, where
+    BEHAVIOUR is tft, allc, alld, random, flaky (garbage on the first attempt of every
+    decision, then tit-for-tat) or broken (never answers)."""
 
-    def __init__(self, model: str = "tft", mode: str = "fast", seed: Optional[int] = None, **kw):
+    def __init__(self, model: str = "tft", mode: str = "fast", **kw):
         kw.setdefault("backoff_s", 0.0)
         super().__init__(model, mode, **kw)
-        self._rng = random.Random(seed)
+        self.behaviour = model.split(":", 1)[0]
+        if self.behaviour not in MOCK_BEHAVIOURS:
+            raise ValueError(f"unknown mock behaviour {self.behaviour!r}; choose from {MOCK_BEHAVIOURS}")
+        self._rng = random.Random()
         self._calls = 0
 
     def _attempt(self, request):
         self._calls += 1
-        if self.model == "broken" or (self.model == "flaky" and self._calls % 2 == 1):
+        if self.behaviour == "broken" or (self.behaviour == "flaky" and self._calls % 2 == 1):
             raise InvalidDecision("mock: not a move")
-        if self.model == "allc":
-            move = "C"
-        elif self.model == "alld":
-            move = "D"
-        elif self.model == "random":
+        if self.behaviour in ("allc", "alld"):
+            move = self.behaviour[-1].upper()
+        elif self.behaviour == "random":
             move = self._rng.choice("CD")
-        else:  # tft / flaky
-            move = "C" if not request.opp else str(request.opp[-1])
-        return _Attempt(decision=Decision(move=move), input_tokens=len(request.user) // 4, output_tokens=5)
+        else:  # tft, flaky
+            move = str(request.opp[-1]) if request.opp else "C"
+        return DecisionResult(decision=Decision(move=move), input_tokens=len(request.user) // 4, output_tokens=5)
 
 
-def make_backend(
-    provider: str,
-    model: str,
-    mode: str,
-    effort: str = "high",
-    base_url: Optional[str] = None,
-    extra_body: Optional[dict] = None,
-    retries: int = 6,
-) -> Backend:
+def make_backend(provider: str, model: str, mode: str, effort: str = "high", base_url: Optional[str] = None,
+                 extra_body: Optional[dict] = None, retries: int = 6) -> Backend:
+    validate_agent(provider, mode)
     if provider == "anthropic":
         return AnthropicBackend(model, mode, effort=effort, retries=retries)
-    if provider == "ollama":
-        url = base_url or os.environ.get("OLLAMA_BASE_URL", DEFAULT_OLLAMA_URL)
-        return OpenAICompatBackend(model, mode, base_url=url, api_key="ollama", effort=effort,
-                                   extra_body=extra_body, retries=retries)
-    if provider == "openai":
-        return OpenAICompatBackend(model, mode, base_url=base_url or os.environ.get("OPENAI_BASE_URL"),
-                                   api_key=os.environ.get("OPENAI_API_KEY", "not-needed"), effort=effort,
-                                   extra_body=extra_body, retries=retries)
     if provider == "mock":
         return MockBackend(model, mode, retries=retries)
-    raise ValueError(f"unknown provider {provider!r}; choose from {PROVIDERS}")
+    url_env, default_url, key_env, default_key = _OPENAI_COMPAT[provider]
+    return OpenAICompatBackend(
+        model, mode,
+        base_url=base_url or os.environ.get(url_env, default_url),
+        api_key=os.environ.get(key_env, default_key) if key_env else default_key,
+        effort=effort, extra_body=extra_body, retries=retries,
+    )

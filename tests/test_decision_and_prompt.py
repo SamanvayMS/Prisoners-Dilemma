@@ -1,26 +1,39 @@
 import axelrod as axl
 import pytest
 
-from pd_agents.decision import C, D, InvalidDecision, parse_decision
+from pd_agents.decision import InvalidDecision, parse_decision, parse_decision_lenient
 from pd_agents.prompt import system_prompt, user_prompt
+
+C, D = axl.Action.C, axl.Action.D
+NON_MOVES = ["", "   ", "C", '{"move": "X"}', '{"action": "C"}', '{"move": "C", "why": 1}']
+
+
+@pytest.mark.parametrize("text, move", [('{"move": "C"}', "C"), ('{"move":"D"}', "D")])
+def test_strict_parse(text, move):
+    assert parse_decision(text).move == move
+
+
+@pytest.mark.parametrize("text", NON_MOVES + ['{"move": "cooperate"}', '```json\n{"move": "C"}\n```'])
+def test_strict_parse_rejects_anything_off_schema(text):
+    with pytest.raises(InvalidDecision):
+        parse_decision(text)
 
 
 @pytest.mark.parametrize("text, move", [
     ('{"move": "C"}', "C"),
-    ('{"move":"D"}', "D"),
     ('<think>they defected twice, so...</think>\n{"move": "D"}', "D"),
     ('```json\n{"move": "C"}\n```', "C"),
     ('Sure. {"move": "cooperate"}', "C"),
     ('{"move": "d"}', "D"),
 ])
-def test_parse_decision_accepts_actionable_answers(text, move):
-    assert parse_decision(text).move == move
+def test_lenient_parse_accepts_actionable_answers(text, move):
+    assert parse_decision_lenient(text).move == move
 
 
-@pytest.mark.parametrize("text", ["", "   ", "C", '{"move": "X"}', '{"action": "C"}', '{"move": "C", "why": 1}'])
-def test_parse_decision_rejects_non_moves(text):
+@pytest.mark.parametrize("text", NON_MOVES)
+def test_lenient_parse_rejects_non_moves(text):
     with pytest.raises(InvalidDecision):
-        parse_decision(text)
+        parse_decision_lenient(text)
 
 
 def test_decision_maps_to_axelrod_actions():
@@ -41,9 +54,9 @@ def test_system_prompt_hides_length_unless_given():
 
 def test_user_prompt_history_and_scores():
     game = axl.Game()
-    assert user_prompt(game, [], []).startswith("Round 1.")
+    assert user_prompt(game, [], []).endswith("round 1.")
     text = user_prompt(game, [C, D, C], [C, C, D])
-    assert "Round 4." in text
+    assert text.endswith("Choose your move for round 4.")
     # CC -> 3/3, DC -> 5/0, CD -> 0/5
     assert "you 8, opponent 8" in text
     assert text.count(" | ") == 3 * 2 + 2  # header row + 3 history rows

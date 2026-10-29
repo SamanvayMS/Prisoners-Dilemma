@@ -7,7 +7,7 @@ import pytest
 import run_tournament
 from pd_agents.backends import AgentDecisionError
 from pd_agents.player import LLMPlayer
-from pd_agents.tournament import AgentTournament
+from pd_agents.tournament import ROSTERS, AgentTournament
 
 
 def mock_player(model="tft", **kw):
@@ -18,7 +18,7 @@ def test_clone_and_pickle_keep_configuration():
     p = mock_player(mode="reasoning", history_window=5, reveal_length=True)
     for copy in (p.clone(), pickle.loads(pickle.dumps(p))):
         assert copy.name == "LLM reasoning (mock:tft)"
-        assert (copy.mode, copy.history_window, copy.reveal_length) == ("reasoning", 5, True)
+        assert copy.init_kwargs == p.init_kwargs
         assert str(copy) == copy.name
 
 
@@ -30,8 +30,8 @@ def test_mock_agent_plays_tit_for_tat_and_logs(tmp_path):
     assert [str(a) for a in agent.history] == list("CCDCDC")
     rows = [json.loads(line) for line in log.read_text().splitlines()]
     assert [r["round"] for r in rows] == [1, 2, 3, 4, 5, 6]
-    assert rows[0]["prev"] is None and rows[1]["prev"] == "CC"
     assert rows[0]["opponent"] == "Alternator"
+    assert {r["attempts"] for r in rows} == {1}
 
 
 def test_length_is_hidden_unless_revealed_and_fixed():
@@ -60,6 +60,11 @@ def test_tournament_stops_when_agent_cannot_answer(processes):
         AgentTournament(players, turns=5, repetitions=1).play(processes=processes, progress_bar=False)
 
 
+@pytest.mark.parametrize("roster", sorted(ROSTERS))
+def test_rosters_load(roster):
+    assert len(ROSTERS[roster]()) > 5
+
+
 def test_agent_spec_parsing():
     spec = run_tournament.AgentSpec.parse("ollama:qwen3:8b@reasoning")
     assert (spec.provider, spec.model, spec.mode) == ("ollama", "qwen3:8b", "reasoning")
@@ -79,8 +84,10 @@ def test_cli_end_to_end_with_mock_agents(tmp_path, capsys):
     for name in ("ranked.txt", "summary.csv", "payoff_matrix.json", "agent_decisions.jsonl", "agent_report.md"):
         assert (tmp_path / name).exists(), name
     report = (tmp_path / "agent_report.md").read_text()
-    assert "LLM fast (mock:tft-as-claude-haiku-4-5)" in report
-    assert "LLM reasoning (mock:tft-as-claude-opus-5-5)" in report
+    assert "LLM fast (mock:tft:claude-haiku-4-5)" in report
+    assert "LLM reasoning (mock:tft:claude-opus-5-5)" in report
+    # A tit-for-tat mock's measured fingerprint is TFT's: 1, 0, 1, 0.
+    assert "| 1.00 | 0.00 | 1.00 | 0.00 |" in report
 
 
 def test_cli_stops_with_exit_code_on_agent_failure(tmp_path):

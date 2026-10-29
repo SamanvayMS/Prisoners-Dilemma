@@ -3,6 +3,7 @@
 from typing import Optional, Sequence
 
 import axelrod as axl
+from axelrod.interaction_utils import compute_final_score
 
 SYSTEM_TEMPLATE = """\
 You are playing an iterated Prisoner's Dilemma against one opponent.
@@ -41,34 +42,26 @@ def user_prompt(
     opp: Sequence[axl.Action],
     history_window: int = 0,
 ) -> str:
-    """History table plus running scores. `history_window=0` shows every round."""
-    round_no = len(own) + 1
+    """History table, then running scores and the current round.
+
+    The table only grows at the end, so consecutive rounds share a prefix.
+    `history_window=0` shows every round.
+    """
     if not own:
-        return "Round 1. No moves have been played yet. Choose your move."
+        return "No moves have been played yet. Choose your move for round 1."
 
-    my_score = their_score = 0
-    rows = []
-    for i, (a, b) in enumerate(zip(own, opp), start=1):
-        mine, theirs = game.score((a, b))
-        my_score += mine
-        their_score += theirs
-        rows.append(f"{i:>4} | {a}   | {b}")
-
-    lines = [f"Round {round_no}."]
-    shown = rows
-    if history_window and len(rows) > history_window:
-        hidden = len(rows) - history_window
+    lines = []
+    start = 0
+    if history_window and len(own) > history_window:
+        start = len(own) - history_window
         lines.append(
-            f"Rounds 1-{hidden} (not shown): you cooperated {_coop(own[:hidden])}, "
-            f"opponent cooperated {_coop(opp[:hidden])}."
+            f"Rounds 1-{start} (not shown): you cooperated {list(own[:start]).count(axl.Action.C)}/{start} "
+            f"rounds, opponent cooperated {list(opp[:start]).count(axl.Action.C)}/{start} rounds."
         )
-        shown = rows[hidden:]
-    lines += ["Round | You | Opponent", *shown]
-    lines.append(f"Total score so far: you {my_score}, opponent {their_score}.")
+    lines.append("Round | You | Opponent")
+    lines += [f"{i:>4} | {own[i - 1]}   | {opp[i - 1]}" for i in range(start + 1, len(own) + 1)]
+    mine, theirs = compute_final_score(list(zip(own, opp)), game)
+    round_no = len(own) + 1
+    lines.append(f"Total score so far: you {mine}, opponent {theirs}.")
     lines.append(f"Choose your move for round {round_no}.")
     return "\n".join(lines)
-
-
-def _coop(actions: Sequence[axl.Action]) -> str:
-    n = sum(1 for a in actions if a == axl.Action.C)
-    return f"{n}/{len(actions)} rounds"
