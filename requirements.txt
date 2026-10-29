@@ -1,0 +1,7 @@
+# 4.14 adds a hard dependency on PyTorch (for one strategy); 4.13.1 has the same
+# tournament engine without it.
+axelrod==4.13.1
+anthropic>=2.3
+openai>=3.41
+pydantic>=2.0
+pytest>=8.0
